@@ -885,6 +885,8 @@ private const val AUDIO_TRACK_MAX_BUFFER_US = 300_000
 private const val AUDIO_TRACK_BUFFER_MULTIPLIER = 2
 private const val AUDIO_WARMUP_OFFSET_US = 250_000L
 private const val AUDIO_WARMUP_WINDOW_MS = 800L
+private const val AUDIO_COLD_WARMUP_OFFSET_US = 450_000L
+private const val AUDIO_COLD_WARMUP_WINDOW_MS = 1_200L
 
 private class BlblRenderersFactory(
     context: Context,
@@ -918,33 +920,85 @@ private class BlblRenderersFactory(
  * and then smoothly catches up instead of running ahead of it.
  */
 private class WarmupDelayAudioSink(sink: AudioSink) : ForwardingAudioSink(sink) {
+    // The warmup window is armed by play()/flush() but only starts counting once the sink reports its first valid
+    // position, i.e. once the AudioTrack exists and has received data. On first load the audio decoder / AudioTrack
+    // are created lazily, so counting from play() would burn the whole window before any sound is possible.
     @Volatile
-    private var playStartedAtMs: Long = 0L
+    private var armed: Boolean = false
+
+    @Volatile
+    private var windowStartedAtMs: Long = 0L
+
+    @Volatile
+    private var playing: Boolean = false
+
+    // True after (re)configure: the output path is cold (e.g. HDMI/TV audio pipeline still waking up), so the
+    // first warmup uses a larger offset/window than resuming from pause.
+    @Volatile
+    private var coldStart: Boolean = true
+
+    @Volatile
+    private var activeOffsetUs: Long = AUDIO_WARMUP_OFFSET_US
+
+    @Volatile
+    private var activeWindowMs: Long = AUDIO_WARMUP_WINDOW_MS
+
+    override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        coldStart = true
+        super.configure(inputFormat, specifiedBufferSize, outputChannels)
+    }
 
     override fun play() {
-        playStartedAtMs = SystemClock.elapsedRealtime()
+        playing = true
+        arm()
         super.play()
     }
 
     override fun pause() {
-        playStartedAtMs = 0L
+        playing = false
+        armed = false
+        windowStartedAtMs = 0L
         super.pause()
     }
 
     override fun flush() {
-        playStartedAtMs = 0L
+        // After a seek / position reset while playing, audio has to refill the track again, so re-arm.
+        windowStartedAtMs = 0L
+        armed = false
         super.flush()
+        if (playing) arm()
+    }
+
+    private fun arm() {
+        if (coldStart) {
+            activeOffsetUs = AUDIO_COLD_WARMUP_OFFSET_US
+            activeWindowMs = AUDIO_COLD_WARMUP_WINDOW_MS
+            coldStart = false
+        } else {
+            activeOffsetUs = AUDIO_WARMUP_OFFSET_US
+            activeWindowMs = AUDIO_WARMUP_WINDOW_MS
+        }
+        windowStartedAtMs = 0L
+        armed = true
     }
 
     override fun getCurrentPositionUs(sourceEnded: Boolean): Long {
         val position = super.getCurrentPositionUs(sourceEnded)
-        if (position == AudioSink.CURRENT_POSITION_NOT_SET || sourceEnded) return position
-        val startedAt = playStartedAtMs
-        if (startedAt == 0L) return position
-        val elapsedMs = SystemClock.elapsedRealtime() - startedAt
-        if (elapsedMs >= AUDIO_WARMUP_WINDOW_MS) return position
-        val remaining = 1.0 - elapsedMs.toDouble() / AUDIO_WARMUP_WINDOW_MS
-        val holdBackUs = (AUDIO_WARMUP_OFFSET_US * remaining).toLong()
+        if (position == AudioSink.CURRENT_POSITION_NOT_SET || sourceEnded || !armed) return position
+        val now = SystemClock.elapsedRealtime()
+        var startedAt = windowStartedAtMs
+        if (startedAt == 0L) {
+            // First valid position since arming: the AudioTrack is live, start the decay window now.
+            startedAt = now
+            windowStartedAtMs = now
+        }
+        val elapsedMs = now - startedAt
+        if (elapsedMs >= activeWindowMs) {
+            armed = false
+            return position
+        }
+        val remaining = 1.0 - elapsedMs.toDouble() / activeWindowMs
+        val holdBackUs = (activeOffsetUs * remaining).toLong()
         return (position - holdBackUs).coerceAtLeast(0L)
     }
 }
