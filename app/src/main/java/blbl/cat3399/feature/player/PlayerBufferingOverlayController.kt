@@ -12,6 +12,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val DEFAULT_BUFFERING_OVERLAY_SHOW_DELAY_MS = 1_000L
+private const val WARMUP_SPINNER_DELAY_MS = 400L
+private const val FADE_IN_MS = 150L
+private const val FADE_OUT_MS = 220L
 
 internal class PlayerBufferingOverlayController(
     private val context: Context,
@@ -26,6 +29,45 @@ internal class PlayerBufferingOverlayController(
     @Volatile private var speedTrackingEnabled: Boolean = false
     private var overlaySuppressedUntilMs: Long = 0L
     private var overlayEligibleAtMs: Long = 0L
+    private var audioWarmupActive: Boolean = false
+    private var warmupJob: Job? = null
+
+    /** Audio output is being woken up before playback starts: show the loading hint right away, with a fade. */
+    fun setAudioWarmup(active: Boolean) {
+        if (audioWarmupActive == active) return
+        audioWarmupActive = active
+        warmupJob?.cancel()
+        warmupJob = null
+        val binding = bindingProvider() ?: return
+        val overlay = binding.bufferingOverlay
+        if (active) {
+            // Short waits show nothing; the spinner only fades in if the wait drags on.
+            warmupJob =
+                scope.launch {
+                    delay(WARMUP_SPINNER_DELAY_MS)
+                    val b = bindingProvider() ?: return@launch
+                    if (!audioWarmupActive) return@launch
+                    b.tvBuffering.text = context.getString(R.string.player_loading)
+                    val o = b.bufferingOverlay
+                    if (o.visibility != View.VISIBLE) {
+                        o.animate().cancel()
+                        o.alpha = 0f
+                        o.visibility = View.VISIBLE
+                        o.animate().alpha(1f).setDuration(FADE_IN_MS).start()
+                    }
+                }
+        } else if (overlay.visibility == View.VISIBLE) {
+            overlay.animate().cancel()
+            overlay.animate()
+                .alpha(0f)
+                .setDuration(FADE_OUT_MS)
+                .withEndAction {
+                    if (!audioWarmupActive) overlay.visibility = View.GONE
+                    overlay.alpha = 1f
+                }
+                .start()
+        }
+    }
 
     fun recordTransferBytes(bytes: Long) {
         if (!speedTrackingEnabled) return
@@ -33,6 +75,7 @@ internal class PlayerBufferingOverlayController(
     }
 
     fun reset() {
+        if (audioWarmupActive) return
         showJob?.cancel()
         showJob = null
         bufferingStateStartedAtMs = 0L
@@ -74,6 +117,7 @@ internal class PlayerBufferingOverlayController(
 
     fun update() {
         val binding = bindingProvider() ?: return
+        if (audioWarmupActive) return
         val nowMs = SystemClock.elapsedRealtime()
         val isBuffering = playbackStateProvider() == Player.STATE_BUFFERING
         val suppressedUntil = overlaySuppressedUntilMs

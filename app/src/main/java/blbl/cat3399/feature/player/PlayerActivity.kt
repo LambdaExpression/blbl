@@ -1022,6 +1022,10 @@ class PlayerActivity : BaseActivity() {
                     }
                 }
 
+                override fun onAudioWarmupChanged(waiting: Boolean) {
+                    bufferingOverlayController.setAudioWarmup(waiting)
+                }
+
                 override fun onRenderedFirstFrame() {
                     if (engine.kind != PlayerEngineKind.IjkPlayer) return
                     if (traceFirstFrameLogged) return
