@@ -26,6 +26,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.hls.playlist.DefaultHlsPlaylistParserFactory
 import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist
@@ -878,16 +879,29 @@ private fun parseLiveHlsAuxBytes(auxRaw: String?): Long? {
 }
 
 private const val LIVE_HLS_DEBUG_RECENT_SEGMENT_COUNT = 3
+private const val AUDIO_TRACK_MIN_BUFFER_US = 120_000
+private const val AUDIO_TRACK_MAX_BUFFER_US = 300_000
+private const val AUDIO_TRACK_BUFFER_MULTIPLIER = 2
 
 private class BlblRenderersFactory(
     context: Context,
     private val volumeBalanceProcessor: VolumeBalanceAudioProcessor,
 ) : DefaultRenderersFactory(context) {
     override fun buildAudioSink(context: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink {
+        // The default AudioTrack buffer (250ms min, x4 multiplier, 750ms max) is large on TV/box hardware.
+        // After first play / resume from pause the sink has to fill it before sound comes out, while video
+        // already advances, so audio is heard noticeably later than the picture. Use a smaller buffer.
+        val bufferSizeProvider =
+            DefaultAudioTrackBufferSizeProvider.Builder()
+                .setMinPcmBufferDurationUs(AUDIO_TRACK_MIN_BUFFER_US)
+                .setMaxPcmBufferDurationUs(AUDIO_TRACK_MAX_BUFFER_US)
+                .setPcmBufferMultiplicationFactor(AUDIO_TRACK_BUFFER_MULTIPLIER)
+                .build()
         return DefaultAudioSink.Builder(context)
             .setEnableFloatOutput(enableFloatOutput)
             .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
             .setAudioProcessors(arrayOf(volumeBalanceProcessor))
+            .setAudioTrackBufferSizeProvider(bufferSizeProvider)
             .build()
     }
 }
