@@ -104,6 +104,32 @@
             android:textSize="@dimen/player_buffering_text_size" />
     </LinearLayout>
 
+    <!-- 音画闸门过渡：只显示居中转圈，不盖灰色遮罩，冻帧画面仍可见。 -->
+    <FrameLayout
+        android:id="@+id/playback_gate_overlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="@android:color/transparent"
+        android:clickable="false"
+        android:focusable="false"
+        android:importantForAccessibility="no"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/player_view"
+        app:layout_constraintEnd_toEndOf="@id/player_view"
+        app:layout_constraintStart_toStartOf="@id/player_view"
+        app:layout_constraintTop_toTopOf="@id/player_view">
+
+        <ProgressBar
+            android:id="@+id/progress_playback_gate"
+            style="?android:attr/progressBarStyleLarge"
+            android:layout_width="@dimen/player_buffering_indicator_size"
+            android:layout_height="@dimen/player_buffering_indicator_size"
+            android:layout_gravity="center"
+            android:indeterminate="true"
+            android:indeterminateTint="?attr/colorOnSurface"
+            android:indeterminateTintMode="src_in" />
+    </FrameLayout>
+
     <androidx.constraintlayout.widget.ConstraintLayout
         android:id="@+id/top_bar"
         android:layout_width="0dp"

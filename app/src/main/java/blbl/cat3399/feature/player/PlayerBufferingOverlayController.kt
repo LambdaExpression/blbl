@@ -12,10 +12,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val DEFAULT_BUFFERING_OVERLAY_SHOW_DELAY_MS = 1_000L
-private const val WARMUP_SPINNER_DELAY_MS = 400L
-private const val FADE_IN_MS = 150L
-private const val FADE_OUT_MS = 220L
+private const val GATE_FADE_IN_MS = 150L
+private const val GATE_FADE_OUT_MS = 220L
 
+/**
+ * 播放页缓冲提示 + 音画起播闸门遮罩。
+ *
+ * 普通缓冲仍延迟显示；闸门打开时立刻全屏淡入过渡动画，解冻后淡出。
+ */
 internal class PlayerBufferingOverlayController(
     private val context: Context,
     private val bindingProvider: () -> ActivityPlayerBinding?,
@@ -30,40 +34,39 @@ internal class PlayerBufferingOverlayController(
     private var overlaySuppressedUntilMs: Long = 0L
     private var overlayEligibleAtMs: Long = 0L
     private var audioWarmupActive: Boolean = false
-    private var warmupJob: Job? = null
 
-    /** Audio output is being woken up before playback starts: show the loading hint right away, with a fade. */
+    /**
+     * 音频输出唤醒 / 视频冻帧期间：立刻展示全屏过渡遮罩。
+     *
+     * @param active true=进入闸门，false=音频已起、画面解冻
+     */
     fun setAudioWarmup(active: Boolean) {
         if (audioWarmupActive == active) return
         audioWarmupActive = active
-        warmupJob?.cancel()
-        warmupJob = null
         val binding = bindingProvider() ?: return
-        val overlay = binding.bufferingOverlay
+        val gate = binding.playbackGateOverlay
         if (active) {
-            // Short waits show nothing; the spinner only fades in if the wait drags on.
-            warmupJob =
-                scope.launch {
-                    delay(WARMUP_SPINNER_DELAY_MS)
-                    val b = bindingProvider() ?: return@launch
-                    if (!audioWarmupActive) return@launch
-                    b.tvBuffering.text = context.getString(R.string.player_loading)
-                    val o = b.bufferingOverlay
-                    if (o.visibility != View.VISIBLE) {
-                        o.animate().cancel()
-                        o.alpha = 0f
-                        o.visibility = View.VISIBLE
-                        o.animate().alpha(1f).setDuration(FADE_IN_MS).start()
-                    }
-                }
-        } else if (overlay.visibility == View.VISIBLE) {
-            overlay.animate().cancel()
-            overlay.animate()
+            // 闸门期间隐藏普通缓冲条，避免两层叠在一起。
+            showJob?.cancel()
+            showJob = null
+            binding.bufferingOverlay.animate().cancel()
+            binding.bufferingOverlay.visibility = View.GONE
+            gate.animate().cancel()
+            if (gate.visibility != View.VISIBLE) {
+                gate.alpha = 0f
+                gate.visibility = View.VISIBLE
+            }
+            gate.animate().alpha(1f).setDuration(GATE_FADE_IN_MS).start()
+        } else if (gate.visibility == View.VISIBLE) {
+            gate.animate().cancel()
+            gate.animate()
                 .alpha(0f)
-                .setDuration(FADE_OUT_MS)
+                .setDuration(GATE_FADE_OUT_MS)
                 .withEndAction {
-                    if (!audioWarmupActive) overlay.visibility = View.GONE
-                    overlay.alpha = 1f
+                    if (!audioWarmupActive) {
+                        gate.visibility = View.GONE
+                        gate.alpha = 1f
+                    }
                 }
                 .start()
         }

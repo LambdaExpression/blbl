@@ -3,8 +3,6 @@
 package blbl.cat3399.feature.player.engine
 
 import android.content.Context
-import android.media.AudioFormat
-import android.media.AudioTrack
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -27,22 +25,24 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.Renderer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
-import androidx.media3.exoplayer.audio.ForwardingAudioSink
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.hls.playlist.DefaultHlsPlaylistParserFactory
 import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist
 import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
 import androidx.media3.exoplayer.hls.playlist.HlsPlaylist
 import androidx.media3.exoplayer.hls.playlist.HlsPlaylistParserFactory
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.ParsingLoadable
+import androidx.media3.exoplayer.video.VideoRendererEventListener
 import blbl.cat3399.core.api.video.VideoMediaRequestProfile
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
@@ -55,6 +55,7 @@ import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.InputStream
+import java.util.ArrayList
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.math.roundToLong
@@ -96,10 +97,17 @@ internal class ExoPlayerEngine(
     private val seamlessQualityController = SeamlessQualitySelectionController()
     private val trackSelector = DefaultTrackSelector(context, SeamlessQualityTrackSelectionFactory(seamlessQualityController))
 
+    /** 音频唤醒与视频冻帧共用闸门；仅 Exo 点播路径使用。 */
+    private val audioWarmupGate = AudioWarmupPlaybackGate()
+
     val exoPlayer: ExoPlayer =
         ExoPlayer.Builder(
             context,
-            BlblRenderersFactory(context.applicationContext, volumeBalanceProcessor) { waiting -> dispatchAudioWarmup(waiting) },
+            BlblRenderersFactory(
+                context.applicationContext,
+                volumeBalanceProcessor,
+                audioWarmupGate,
+            ) { waiting -> dispatchAudioWarmup(waiting) },
         )
             .setLoadControl(loadControl)
             .setTrackSelector(trackSelector)
@@ -109,7 +117,7 @@ internal class ExoPlayerEngine(
     private val listeners: MutableSet<BlblPlayerEngine.Listener> = CopyOnWriteArraySet()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Called from the playback thread by the audio sink; listeners expect the main thread.
+    // 播放线程回调；转主线程给 Activity 遮罩动画。
     private fun dispatchAudioWarmup(waiting: Boolean) {
         mainHandler.post { listeners.forEach { it.onAudioWarmupChanged(waiting) } }
     }
@@ -896,25 +904,18 @@ private const val LIVE_HLS_DEBUG_RECENT_SEGMENT_COUNT = 3
 private const val AUDIO_TRACK_MIN_BUFFER_US = 120_000
 private const val AUDIO_TRACK_MAX_BUFFER_US = 300_000
 private const val AUDIO_TRACK_BUFFER_MULTIPLIER = 2
-// Audio output idle-standby handling (see WakeBeforePlayAudioSink).
-private const val AUDIO_WAKE_IDLE_THRESHOLD_MS = 1_500L
-private const val AUDIO_WAKE_MIN_MS = 120L
-private const val AUDIO_WAKE_CONFIRM_MS = 120L
-private const val AUDIO_WAKE_TIMEOUT_MS = 900L
-private const val AUDIO_WAKE_POLL_MS = 15L
-private const val AUDIO_WAKE_RELEASE_DELAY_MS = 400L
-private const val AUDIO_FADE_IN_MS = 180L
-private const val AUDIO_FADE_STEP_MS = 12L
 
+/**
+ * 自定义渲染工厂：缩小 AudioTrack 缓冲，并挂上音画起播闸门。
+ */
 private class BlblRenderersFactory(
     context: Context,
     private val volumeBalanceProcessor: VolumeBalanceAudioProcessor,
+    private val audioWarmupGate: AudioWarmupPlaybackGate,
     private val onAudioWarmupChanged: (Boolean) -> Unit,
 ) : DefaultRenderersFactory(context) {
     override fun buildAudioSink(context: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink {
-        // The default AudioTrack buffer (250ms min, x4 multiplier, 750ms max) is large on TV/box hardware.
-        // After first play / resume from pause the sink has to fill it before sound comes out, while video
-        // already advances, so audio is heard noticeably later than the picture. Use a smaller buffer.
+        // 默认 AudioTrack 缓冲偏大，TV/盒子上首播/恢复时画面会先于声音。
         val bufferSizeProvider =
             DefaultAudioTrackBufferSizeProvider.Builder()
                 .setMinPcmBufferDurationUs(AUDIO_TRACK_MIN_BUFFER_US)
@@ -928,203 +929,32 @@ private class BlblRenderersFactory(
                 .setAudioProcessors(arrayOf(volumeBalanceProcessor))
                 .setAudioTrackBufferSizeProvider(bufferSizeProvider)
                 .build()
-        return WarmupDelayAudioSink(sink, onAudioWarmupChanged)
-    }
-}
-
-/**
- * Fix for "sound comes out later than the picture" on devices whose audio output goes to standby when idle
- * (AudioFlinger puts the output thread to standby ~3s after the last active track; HDMI/TV sinks also re-sync).
- *
- * Wake before play: when the sink has been idle for a while (first start, switching episodes, long pause), the
- *    first part of the audio is swallowed while the output wakes up, but the playback position already advances,
- *    so the picture runs ahead. Before really starting the sink we play a near-silent AudioTrack on the same
- *    output, wait until it is actually being consumed, then start the real track. Position is frozen meanwhile, so
- *    picture and sound start together.
- */
-private class WarmupDelayAudioSink(
-    sink: AudioSink,
-    private val onWaitingChanged: (Boolean) -> Unit,
-) : ForwardingAudioSink(sink) {
-    // Only touched on the playback thread.
-    private var handler: Handler? = null
-    private var sampleRateHz: Int = 48_000
-    private var lastInactiveAtMs: Long = 0L // 0 = never played: treat as idle.
-    private var startPending: Boolean = false
-    private var wakeStartedAtMs: Long = 0L
-    private var wakeTrack: AudioTrack? = null
-    private var userVolume: Float = 1f
-    private var fading: Boolean = false
-    private var fadeStartedAtMs: Long = 0L
-
-    private val fadeRunnable =
-        object : Runnable {
-            override fun run() {
-                if (!fading) return
-                val t = ((SystemClock.elapsedRealtime() - fadeStartedAtMs).toFloat() / AUDIO_FADE_IN_MS).coerceIn(0f, 1f)
-                if (t >= 1f) {
-                    fading = false
-                    applyVolume(userVolume)
-                } else {
-                    applyVolume(userVolume * t * t)
-                    handler?.postDelayed(this, AUDIO_FADE_STEP_MS)
-                }
-            }
-        }
-
-    private fun applyVolume(volume: Float) = super.setVolume(volume)
-
-    override fun setVolume(volume: Float) {
-        userVolume = volume
-        if (!fading) super.setVolume(volume)
+        return WarmupDelayAudioSink(sink, audioWarmupGate, onAudioWarmupChanged)
     }
 
-    private fun cancelFade() {
-        if (!fading) return
-        fading = false
-        handler?.removeCallbacks(fadeRunnable)
-        super.setVolume(userVolume)
-    }
-
-    private val pollRunnable =
-        object : Runnable {
-            override fun run() {
-                if (!startPending) return
-                val elapsedMs = SystemClock.elapsedRealtime() - wakeStartedAtMs
-                val consumedFrames = runCatching { wakeTrack?.playbackHeadPosition ?: 0 }.getOrDefault(0)
-                val confirmFrames = sampleRateHz * AUDIO_WAKE_CONFIRM_MS / 1000
-                val awake = elapsedMs >= AUDIO_WAKE_MIN_MS && consumedFrames >= confirmFrames
-                if (awake || elapsedMs >= AUDIO_WAKE_TIMEOUT_MS) {
-                    AppLog.i("AudioWake", "output awake after ${elapsedMs}ms consumedFrames=$consumedFrames timeout=${!awake}")
-                    startPending = false
-                    onWaitingChanged(false)
-                    releaseWakeTrackLater()
-                    startNow(fadeIn = true)
-                } else {
-                    handler?.postDelayed(this, AUDIO_WAKE_POLL_MS)
-                }
-            }
-        }
-
-    override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
-        if (inputFormat.sampleRate > 0) sampleRateHz = inputFormat.sampleRate
-        super.configure(inputFormat, specifiedBufferSize, outputChannels)
-    }
-
-    override fun play() {
-        if (startPending) return
-        val now = SystemClock.elapsedRealtime()
-        val idleMs = if (lastInactiveAtMs == 0L) Long.MAX_VALUE else now - lastInactiveAtMs
-        if (idleMs < AUDIO_WAKE_IDLE_THRESHOLD_MS) {
-            startNow()
-            return
-        }
-        val track = createWakeTrack()
-        if (track == null) {
-            startNow()
-            return
-        }
-        AppLog.i("AudioWake", "waking output before play idleMs=${if (idleMs == Long.MAX_VALUE) -1L else idleMs}")
-        val h = handler ?: Handler(Looper.myLooper() ?: Looper.getMainLooper()).also { handler = it }
-        wakeTrack = track
-        wakeStartedAtMs = now
-        startPending = true
-        onWaitingChanged(true)
-        h.postDelayed(pollRunnable, AUDIO_WAKE_POLL_MS)
-    }
-
-    private fun startNow(fadeIn: Boolean = false) {
-        if (fadeIn && handler != null) {
-            // Start silent and ramp up, so the first audible samples after the output wakes are not abrupt.
-            fading = true
-            fadeStartedAtMs = SystemClock.elapsedRealtime()
-            applyVolume(0f)
-            handler?.postDelayed(fadeRunnable, AUDIO_FADE_STEP_MS)
-        }
-        super.play()
-    }
-
-    override fun pause() {
-        cancelFade()
-        cancelPendingStart()
-        lastInactiveAtMs = SystemClock.elapsedRealtime()
-        super.pause()
-    }
-
-    override fun reset() {
-        cancelFade()
-        cancelPendingStart()
-        lastInactiveAtMs = SystemClock.elapsedRealtime()
-        super.reset()
-    }
-
-    private fun cancelPendingStart() {
-        if (startPending) {
-            startPending = false
-            handler?.removeCallbacks(pollRunnable)
-            onWaitingChanged(false)
-        }
-        releaseWakeTrack()
-    }
-
-    /** Near-silent (+-1 LSB, inaudible) so sinks with digital-silence auto-mute still treat the output as active. */
-    private fun createWakeTrack(): AudioTrack? {
-        return runCatching {
-            val rate = sampleRateHz.coerceIn(8_000, 192_000)
-            val bytes = rate * 4 // 1s of 16-bit stereo
-            val pcm = ByteArray(bytes)
-            var i = 0
-            while (i + 1 < bytes) {
-                // little-endian 16-bit: alternate +1 / -1
-                if ((i / 4) % 2 == 0) {
-                    pcm[i] = 1
-                    pcm[i + 1] = 0
-                } else {
-                    pcm[i] = -1
-                    pcm[i + 1] = -1
-                }
-                i += 2
-            }
-            val track =
-                AudioTrack.Builder()
-                    .setAudioAttributes(
-                        android.media.AudioAttributes.Builder()
-                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_UNKNOWN)
-                            .build(),
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(rate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                            .build(),
-                    )
-                    .setBufferSizeInBytes(bytes)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
-            track.write(pcm, 0, bytes)
-            track.play()
-            track
-        }.onFailure { AppLog.w("AudioWake", "create wake track failed", it) }.getOrNull()
-    }
-
-    private fun releaseWakeTrack() {
-        val track = wakeTrack ?: return
-        wakeTrack = null
-        runCatching { track.stop() }
-        runCatching { track.release() }
-    }
-
-    /** Keep the wake track alive briefly so the output never goes idle between it and the real track. */
-    private fun releaseWakeTrackLater() {
-        val track = wakeTrack ?: return
-        wakeTrack = null
-        val release = Runnable {
-            runCatching { track.stop() }
-            runCatching { track.release() }
-        }
-        val h = handler
-        if (h != null) h.postDelayed(release, AUDIO_WAKE_RELEASE_DELAY_MS) else release.run()
+    override fun buildVideoRenderers(
+        context: Context,
+        extensionRendererMode: Int,
+        mediaCodecSelector: MediaCodecSelector,
+        enableDecoderFallback: Boolean,
+        eventHandler: Handler,
+        eventListener: VideoRendererEventListener,
+        allowedVideoJoiningTimeMs: Long,
+        out: ArrayList<Renderer>,
+    ) {
+        // 本应用未开 extension 解码器；只挂带闸门的 MediaCodec 视频渲染器。
+        out.add(
+            GatedMediaCodecVideoRenderer(
+                context,
+                getCodecAdapterFactory(),
+                mediaCodecSelector,
+                allowedVideoJoiningTimeMs,
+                enableDecoderFallback,
+                eventHandler,
+                eventListener,
+                GATED_VIDEO_MAX_DROPPED_FRAMES_TO_NOTIFY,
+                audioWarmupGate,
+            ),
+        )
     }
 }
