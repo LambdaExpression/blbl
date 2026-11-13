@@ -27,6 +27,7 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
+import androidx.media3.exoplayer.audio.ForwardingAudioSink
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.hls.playlist.DefaultHlsPlaylistParserFactory
 import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist
@@ -882,6 +883,8 @@ private const val LIVE_HLS_DEBUG_RECENT_SEGMENT_COUNT = 3
 private const val AUDIO_TRACK_MIN_BUFFER_US = 120_000
 private const val AUDIO_TRACK_MAX_BUFFER_US = 300_000
 private const val AUDIO_TRACK_BUFFER_MULTIPLIER = 2
+private const val AUDIO_WARMUP_OFFSET_US = 250_000L
+private const val AUDIO_WARMUP_WINDOW_MS = 800L
 
 private class BlblRenderersFactory(
     context: Context,
@@ -897,11 +900,51 @@ private class BlblRenderersFactory(
                 .setMaxPcmBufferDurationUs(AUDIO_TRACK_MAX_BUFFER_US)
                 .setPcmBufferMultiplicationFactor(AUDIO_TRACK_BUFFER_MULTIPLIER)
                 .build()
-        return DefaultAudioSink.Builder(context)
-            .setEnableFloatOutput(enableFloatOutput)
-            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-            .setAudioProcessors(arrayOf(volumeBalanceProcessor))
-            .setAudioTrackBufferSizeProvider(bufferSizeProvider)
-            .build()
+        val sink =
+            DefaultAudioSink.Builder(context)
+                .setEnableFloatOutput(enableFloatOutput)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .setAudioProcessors(arrayOf(volumeBalanceProcessor))
+                .setAudioTrackBufferSizeProvider(bufferSizeProvider)
+                .build()
+        return WarmupDelayAudioSink(sink)
+    }
+}
+
+/**
+ * Fallback for devices whose AudioTrack reports "position advancing" before sound is actually audible
+ * (first play, resume from pause, after seek). For a short window after every [play] the reported audio
+ * position is held back by an offset that decays linearly to zero, so video starts slightly behind the audio
+ * and then smoothly catches up instead of running ahead of it.
+ */
+private class WarmupDelayAudioSink(sink: AudioSink) : ForwardingAudioSink(sink) {
+    @Volatile
+    private var playStartedAtMs: Long = 0L
+
+    override fun play() {
+        playStartedAtMs = SystemClock.elapsedRealtime()
+        super.play()
+    }
+
+    override fun pause() {
+        playStartedAtMs = 0L
+        super.pause()
+    }
+
+    override fun flush() {
+        playStartedAtMs = 0L
+        super.flush()
+    }
+
+    override fun getCurrentPositionUs(sourceEnded: Boolean): Long {
+        val position = super.getCurrentPositionUs(sourceEnded)
+        if (position == AudioSink.CURRENT_POSITION_NOT_SET || sourceEnded) return position
+        val startedAt = playStartedAtMs
+        if (startedAt == 0L) return position
+        val elapsedMs = SystemClock.elapsedRealtime() - startedAt
+        if (elapsedMs >= AUDIO_WARMUP_WINDOW_MS) return position
+        val remaining = 1.0 - elapsedMs.toDouble() / AUDIO_WARMUP_WINDOW_MS
+        val holdBackUs = (AUDIO_WARMUP_OFFSET_US * remaining).toLong()
+        return (position - holdBackUs).coerceAtLeast(0L)
     }
 }
