@@ -72,5 +72,8 @@ internal interface BlblPlayerEngine {
         fun onVideoTrackChanged(qn: Int, codecid: Int) {}
 
         fun onRenderedFirstFrame() {}
+
+        /** ExoPlayer only: true while playback start is held back until the audio output is awake. */
+        fun onAudioWarmupChanged(waiting: Boolean) {}
     }
 }
